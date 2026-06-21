@@ -7,6 +7,9 @@ class Customer {
     required this.phone,
     required this.createdAt,
     this.notes = '',
+    this.totalCreditPaise = 0,
+    this.totalPaymentPaise = 0,
+    this.balancePaise = 0,
   });
 
   final int id;
@@ -14,6 +17,9 @@ class Customer {
   final String phone;
   final DateTime createdAt;
   final String notes;
+  final int totalCreditPaise;
+  final int totalPaymentPaise;
+  final int balancePaise;
 }
 
 class LedgerEntry {
@@ -21,21 +27,25 @@ class LedgerEntry {
     required this.id,
     required this.customerId,
     required this.customerName,
+    required this.customerPhone,
     required this.type,
     required this.amountPaise,
     required this.description,
     required this.createdAt,
     this.isSynced = false,
+    this.isDeleted = false,
   });
 
   final int id;
   final int customerId;
   final String customerName;
+  final String customerPhone;
   final LedgerEntryType type;
   final int amountPaise;
   final String description;
   final DateTime createdAt;
   final bool isSynced;
+  final bool isDeleted;
 
   int get signedAmountPaise => type == LedgerEntryType.credit ? amountPaise : -amountPaise;
 }

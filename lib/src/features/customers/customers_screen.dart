@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/currency.dart';
 import '../../data/ledger_repository.dart';
+import '../../data/models.dart';
 import 'customer_detail_screen.dart';
 
 class CustomersScreen extends ConsumerWidget {
@@ -12,48 +13,19 @@ class CustomersScreen extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final customers = ref.watch(customersProvider);
 
-    return Scaffold(
-      appBar: AppBar(title: const Text('Customers')),
-      body: customers.when(
-        data: (items) => items.isEmpty
-            ? const Center(child: Text('No customers added yet.'))
-            : ListView.builder(
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                itemCount: items.length,
-                itemBuilder: (context, index) {
-                  final item = items[index];
-                  final balanceColor = item.balancePaise > 0 ? Colors.red.shade700 : (item.balancePaise < 0 ? Colors.green.shade700 : Colors.grey);
-                  
-                  return ListTile(
-                    leading: CircleAvatar(
-                      backgroundColor: Theme.of(context).colorScheme.primaryContainer,
-                      child: Text(item.customer.name.characters.first.toUpperCase(), 
-                          style: TextStyle(color: Theme.of(context).colorScheme.onPrimaryContainer)),
-                    ),
-                    title: Text(item.customer.name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                    subtitle: Text(item.customer.phone.isEmpty ? 'No phone' : item.customer.phone),
-                    trailing: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        Text(formatMoney(item.balancePaise.abs()), 
-                            style: TextStyle(fontWeight: FontWeight.bold, color: balanceColor, fontSize: 16)),
-                        Text(item.balancePaise >= 0 ? 'Due' : 'Advance', 
-                            style: TextStyle(fontSize: 10, color: balanceColor)),
-                      ],
-                    ),
-                    onTap: () => Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) => CustomerDetailScreen(customerId: item.customer.id),
-                      ),
-                    ),
-                  );
-                },
-              ),
-        loading: () => const Center(child: CircularProgressIndicator()),
-        error: (error, _) => Center(child: Text('Customer error: $error')),
-      ),
+    return customers.when(
+      data: (items) => items.isEmpty
+          ? const Center(child: Text('No customers added yet.'))
+          : ListView.builder(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              itemCount: items.length,
+              itemBuilder: (context, index) {
+                final item = items[index];
+                return _CustomerTile(item: item);
+              },
+            ),
+      loading: () => const Center(child: CircularProgressIndicator()),
+      error: (error, _) => Center(child: Text('Customer error: $error')),
     );
   }
 
@@ -108,6 +80,74 @@ class CustomersScreen extends ConsumerWidget {
             child: const Text('Save'),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _CustomerTile extends StatefulWidget {
+  const _CustomerTile({required this.item});
+  final CustomerBalance item;
+
+  @override
+  State<_CustomerTile> createState() => _CustomerTileState();
+}
+
+class _CustomerTileState extends State<_CustomerTile> {
+  bool _revealed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final balanceColor = widget.item.balancePaise > 0 
+        ? Colors.red.shade700 
+        : (widget.item.balancePaise < 0 ? Colors.green.shade700 : Colors.grey);
+
+    return ListTile(
+      leading: CircleAvatar(
+        backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+        child: Text(widget.item.customer.name.characters.first.toUpperCase(), 
+            style: TextStyle(color: Theme.of(context).colorScheme.onPrimaryContainer)),
+      ),
+      title: Text(widget.item.customer.name, style: const TextStyle(fontWeight: FontWeight.bold)),
+      subtitle: Text(widget.item.customer.phone.isEmpty ? 'No phone' : widget.item.customer.phone),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(
+                _revealed ? formatMoney(widget.item.balancePaise.abs()) : '••••', 
+                style: TextStyle(
+                  fontWeight: FontWeight.bold, 
+                  color: balanceColor, 
+                  fontSize: 16,
+                  letterSpacing: _revealed ? null : 2,
+                ),
+              ),
+              Text(widget.item.balancePaise >= 0 ? 'Due' : 'Advance', 
+                  style: TextStyle(fontSize: 10, color: balanceColor)),
+            ],
+          ),
+          const SizedBox(width: 8),
+          IconButton(
+            icon: Icon(
+              _revealed ? Icons.visibility_outlined : Icons.visibility_off_outlined,
+              size: 18,
+              color: Colors.grey,
+            ),
+            onPressed: () => setState(() => _revealed = !_revealed),
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(),
+          ),
+        ],
+      ),
+      onTap: () => Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => CustomerDetailScreen(customerId: widget.item.customer.id),
+        ),
       ),
     );
   }

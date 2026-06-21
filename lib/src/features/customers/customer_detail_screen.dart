@@ -4,7 +4,6 @@ import 'package:share_plus/share_plus.dart';
 import '../../core/currency.dart';
 import '../../data/ledger_repository.dart';
 import '../../data/models.dart';
-import '../ledger/ledger_screen.dart';
 
 class CustomerDetailScreen extends ConsumerWidget {
   const CustomerDetailScreen({super.key, required this.customerId});
@@ -29,6 +28,11 @@ class CustomerDetailScreen extends ConsumerWidget {
           appBar: AppBar(
             title: Text(customerBalance.customer.name),
             actions: [
+              IconButton(
+                icon: const Icon(Icons.history_outlined),
+                tooltip: 'Restore customer history from Cloud',
+                onPressed: () => _showRestoreConfirm(context, ref),
+              ),
               Padding(
                 padding: const EdgeInsets.only(right: 16.0),
                 child: Center(
@@ -51,12 +55,6 @@ class CustomerDetailScreen extends ConsumerWidget {
                   leading: const Icon(Icons.phone_outlined),
                   title: Text(customerBalance.customer.phone),
                   subtitle: const Text('Mobile'),
-                  trailing: IconButton(
-                    icon: const Icon(Icons.message_outlined),
-                    onPressed: () {
-                      // Future: Send WhatsApp/SMS reminder
-                    },
-                  ),
                 ),
               const Divider(height: 1),
               Expanded(
@@ -122,6 +120,31 @@ class CustomerDetailScreen extends ConsumerWidget {
     );
   }
 
+  Future<void> _showRestoreConfirm(BuildContext context, WidgetRef ref) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Restore customer history?'),
+        content: const Text('This will pull all transaction history for this customer from your Google Sheet. It will not delete your current local data, just add missing records.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('Restore History')),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      final repo = ref.read(ledgerRepositoryProvider);
+      final result = await ref.read(backupServiceProvider).restoreFromGoogleSheets(repo, filterCustomerId: customerId);
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(result.message)));
+        ref.invalidate(customerProvider(customerId));
+        ref.invalidate(customerEntriesProvider(customerId));
+        ref.invalidate(dashboardProvider);
+      }
+    }
+  }
+
   void _showOptions(BuildContext context, WidgetRef ref, LedgerEntry entry, Customer customer) {
     showModalBottomSheet(
       context: context,
@@ -130,15 +153,6 @@ class CustomerDetailScreen extends ConsumerWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           const SizedBox(height: 8),
-          ListTile(
-            leading: const Icon(Icons.share_outlined),
-            title: const Text('Share to WhatsApp'),
-            onTap: () {
-              Navigator.pop(context);
-              final text = 'Hello ${customer.name}, a ${entry.type.name} of ${formatMoney(entry.amountPaise)} was added to your ledger. ${entry.description.isNotEmpty ? "Details: ${entry.description}" : ""}\n\nPowered by Smart Ledger AI';
-              Share.share(text);
-            },
-          ),
           ListTile(
             leading: const Icon(Icons.share_outlined),
             title: const Text('Share to WhatsApp'),
@@ -186,7 +200,7 @@ class CustomerDetailScreen extends ConsumerWidget {
                 context: context,
                 builder: (context) => AlertDialog(
                   title: const Text('Delete transaction?'),
-                  content: const Text('Are you sure you want to delete this entry? This cannot be undone.'),
+                  content: const Text('Are you sure you want to delete this entry?'),
                   actions: [
                     TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
                     TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('Delete', style: TextStyle(color: Colors.red))),
@@ -210,8 +224,6 @@ class CustomerDetailScreen extends ConsumerWidget {
   }
 
   Future<void> _showEntrySheet(BuildContext context, WidgetRef ref, Customer customer, {LedgerEntry? existingEntry}) async {
-    // Re-use the sheet logic from LedgerScreen or implement specialized one
-    // For now, using the one we optimized in LedgerScreen but customized for this customer
     final amount = TextEditingController(text: existingEntry != null ? (existingEntry.amountPaise / 100).toString() : '');
     final description = TextEditingController(text: existingEntry?.description ?? '');
     var type = existingEntry?.type ?? LedgerEntryType.credit;

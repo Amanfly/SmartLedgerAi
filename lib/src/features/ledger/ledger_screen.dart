@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../../core/currency.dart';
+import '../../core/whatsapp_api_service.dart';
 import '../../data/ledger_repository.dart';
 import '../../data/models.dart';
 
@@ -14,52 +15,46 @@ class LedgerScreen extends ConsumerWidget {
     final dashboard = ref.watch(dashboardProvider);
     final entries = ref.watch(entriesProvider);
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Smart Ledger AI'),
-        centerTitle: false,
-      ),
-      body: RefreshIndicator(
-        onRefresh: () async {
-          ref.invalidate(dashboardProvider);
-          ref.invalidate(entriesProvider);
-        },
-        child: CustomScrollView(
-          slivers: [
-            SliverPadding(
-              padding: const EdgeInsets.all(16),
-              sliver: SliverToBoxAdapter(
-                child: dashboard.when(
-                  data: (item) => _SummaryGrid(summary: item),
-                  loading: () => const Center(child: LinearProgressIndicator()),
-                  error: (error, _) => Text('Dashboard error: $error'),
-                ),
+    return RefreshIndicator(
+      onRefresh: () async {
+        ref.invalidate(dashboardProvider);
+        ref.invalidate(entriesProvider);
+      },
+      child: CustomScrollView(
+        slivers: [
+          SliverPadding(
+            padding: const EdgeInsets.all(16),
+            sliver: SliverToBoxAdapter(
+              child: dashboard.when(
+                data: (item) => _SummaryGrid(summary: item),
+                loading: () => const Center(child: LinearProgressIndicator()),
+                error: (error, _) => Text('Dashboard error: $error'),
               ),
             ),
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
-                child: Text('Recent Transactions', style: Theme.of(context).textTheme.titleLarge),
-              ),
+          ),
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+              child: Text('Recent Transactions', style: Theme.of(context).textTheme.titleLarge),
             ),
-            entries.when(
-              data: (items) => items.isEmpty
-                  ? const SliverFillRemaining(
-                      hasScrollBody: false,
-                      child: Center(child: Text('No transactions yet.')),
-                    )
-                  : SliverList(
-                      delegate: SliverChildBuilderDelegate(
-                        (context, index) => _EntryTile(items[index], ref: ref),
-                        childCount: items.length,
-                      ),
+          ),
+          entries.when(
+            data: (items) => items.isEmpty
+                ? const SliverFillRemaining(
+                    hasScrollBody: false,
+                    child: Center(child: Text('No transactions yet.')),
+                  )
+                : SliverList(
+                    delegate: SliverChildBuilderDelegate(
+                      (context, index) => _EntryTile(items[index], ref: ref),
+                      childCount: items.length,
                     ),
-              loading: () => const SliverToBoxAdapter(child: Center(child: CircularProgressIndicator())),
-              error: (error, _) => SliverToBoxAdapter(child: Text('Ledger error: $error')),
-            ),
-            const SliverToBoxAdapter(child: SizedBox(height: 80)), // Space for FAB
-          ],
-        ),
+                  ),
+            loading: () => const SliverToBoxAdapter(child: Center(child: CircularProgressIndicator())),
+            error: (error, _) => SliverToBoxAdapter(child: Text('Ledger error: $error')),
+          ),
+          const SliverToBoxAdapter(child: SizedBox(height: 100)), // Space for FAB
+        ],
       ),
     );
   }
@@ -70,6 +65,7 @@ class LedgerScreen extends ConsumerWidget {
     var type = existingEntry?.type ?? LedgerEntryType.credit;
     int? selectedCustomerId = existingEntry?.customerId;
     final customers = ref.read(customersProvider).asData?.value ?? [];
+    bool notifyViaWhatsApp = false;
 
     await showModalBottomSheet<void>(
       context: context,
@@ -120,7 +116,15 @@ class LedgerScreen extends ConsumerWidget {
                 controller: description,
                 decoration: const InputDecoration(labelText: 'Product details / Description', border: OutlineInputBorder()),
               ),
-              const SizedBox(height: 12),
+              const SizedBox(height: 8),
+              CheckboxListTile(
+                title: const Text('Send WhatsApp Notification', style: TextStyle(fontSize: 14)),
+                value: notifyViaWhatsApp,
+                onChanged: (val) => setState(() => notifyViaWhatsApp = val ?? false),
+                controlAffinity: ListTileControlAffinity.leading,
+                contentPadding: EdgeInsets.zero,
+              ),
+              const SizedBox(height: 8),
               FilledButton.icon(
                 onPressed: (selectedCustomerId == null || customers.isEmpty)
                     ? null
@@ -144,6 +148,24 @@ class LedgerScreen extends ConsumerWidget {
                             description: description.text,
                           );
                         }
+                        
+                        if (notifyViaWhatsApp) {
+                          final balance = await repo.getCustomerBalance(selectedCustomerId!);
+                          final customer = customers.firstWhere((c) => c.customer.id == selectedCustomerId).customer;
+                          final merchantPhone = await repo.getSetting('merchant_phone', '');
+                          
+                          await LedgerScreen.sendWhatsAppNotification(
+                            ref: ref,
+                            customerName: customer.name,
+                            customerPhone: customer.phone,
+                            type: type,
+                            amount: rupeesToPaise(parsedAmount),
+                            description: description.text,
+                            totalBalance: balance?.balancePaise ?? 0,
+                            merchantPhone: merchantPhone,
+                          );
+                        }
+
                         ref.invalidate(dashboardProvider);
                         ref.invalidate(customersProvider);
                         ref.invalidate(entriesProvider);
@@ -159,6 +181,54 @@ class LedgerScreen extends ConsumerWidget {
         ),
       ),
     );
+  }
+
+  static Future<void> sendWhatsAppNotification({
+    required WidgetRef ref,
+    required String customerName,
+    required String customerPhone,
+    required LedgerEntryType type,
+    required int amount,
+    required String description,
+    required int totalBalance,
+    required String merchantPhone,
+  }) async {
+    final apiService = ref.read(whatsappApiServiceProvider);
+    
+    // Attempt automatic send via API first
+    final apiSuccess = await apiService.sendNotification(
+      toPhone: customerPhone,
+      customerName: customerName,
+      type: type.name,
+      amount: formatMoney(amount),
+      description: description,
+      totalBalance: formatMoney(totalBalance),
+      merchantPhone: merchantPhone,
+    );
+
+    // If API fails or is not configured, fallback to manual sharing
+    if (!apiSuccess) {
+      String text;
+      if (type == LedgerEntryType.credit) {
+        text = 'Hello $customerName,\n\n'
+            'New Credit (Udhar) added: ${formatMoney(amount)}\n'
+            '${description.isNotEmpty ? "Details: $description\n" : ""}'
+            'Total Balance Due: ${formatMoney(totalBalance)}\n\n';
+        
+        if (merchantPhone.isNotEmpty) {
+          text += 'Please pay online to: $merchantPhone\n\n';
+        }
+      } else {
+        text = 'Hello $customerName,\n\n'
+            'Payment (Jama) Received: ${formatMoney(amount)}\n'
+            '${description.isNotEmpty ? "Details: $description\n" : ""}'
+            'Remaining Balance: ${formatMoney(totalBalance)}\n\n'
+            'Thank you for your payment!';
+      }
+      
+      text += '\nPowered by Smart Ledger AI';
+      Share.share(text);
+    }
   }
 }
 
@@ -185,7 +255,7 @@ class _SummaryGrid extends StatelessWidget {
   }
 }
 
-class _SummaryCard extends StatelessWidget {
+class _SummaryCard extends StatefulWidget {
   const _SummaryCard({required this.title, required this.value, required this.icon, required this.color});
   final String title;
   final String value;
@@ -193,25 +263,53 @@ class _SummaryCard extends StatelessWidget {
   final Color color;
 
   @override
+  State<_SummaryCard> createState() => _SummaryCardState();
+}
+
+class _SummaryCardState extends State<_SummaryCard> {
+  bool _revealed = false;
+
+  @override
   Widget build(BuildContext context) {
     return Card(
       elevation: 0,
-      color: color.withValues(alpha: 0.1),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Icon(icon, color: color, size: 20),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(value, style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold, color: color)),
-                Text(title, style: Theme.of(context).textTheme.bodySmall),
-              ],
-            ),
-          ],
+      color: widget.color.withValues(alpha: 0.1),
+      child: InkWell(
+        onTap: () => setState(() => _revealed = !_revealed),
+        borderRadius: BorderRadius.circular(12),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Icon(widget.icon, color: widget.color, size: 20),
+                  Icon(
+                    _revealed ? Icons.visibility_outlined : Icons.visibility_off_outlined,
+                    color: widget.color.withValues(alpha: 0.5),
+                    size: 14,
+                  ),
+                ],
+              ),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    _revealed ? widget.value : '••••',
+                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                          fontWeight: FontWeight.bold, 
+                          color: widget.color,
+                          letterSpacing: _revealed ? null : 2,
+                        ),
+                  ),
+                  Text(widget.title, style: Theme.of(context).textTheme.bodySmall),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -273,29 +371,19 @@ class _EntryTile extends StatelessWidget {
             onTap: () async {
               Navigator.pop(context);
               final repo = ref.read(ledgerRepositoryProvider);
-              final balance = await repo.getCustomerBalance(entry.customerId);
               final merchantPhone = await repo.getSetting('merchant_phone', '');
+              final balance = await repo.getCustomerBalance(entry.customerId);
               
-              String text;
-              if (entry.type == LedgerEntryType.credit) {
-                text = 'Hello ${entry.customerName},\n\n'
-                    'New Credit (Udhar) added: ${formatMoney(entry.amountPaise)}\n'
-                    '${entry.description.isNotEmpty ? "Details: ${entry.description}\n" : ""}'
-                    'Total Balance Due: ${formatMoney(balance?.balancePaise ?? 0)}\n\n';
-                
-                if (merchantPhone.isNotEmpty) {
-                  text += 'Please pay online to: $merchantPhone\n\n';
-                }
-              } else {
-                text = 'Hello ${entry.customerName},\n\n'
-                    'Payment (Jama) Received: ${formatMoney(entry.amountPaise)}\n'
-                    '${entry.description.isNotEmpty ? "Details: ${entry.description}\n" : ""}'
-                    'Remaining Balance: ${formatMoney(balance?.balancePaise ?? 0)}\n\n'
-                    'Thank you for your payment!';
-              }
-              
-              text += '\nPowered by Smart Ledger AI';
-              Share.share(text);
+              await LedgerScreen.sendWhatsAppNotification(
+                ref: ref,
+                customerName: entry.customerName,
+                customerPhone: entry.customerPhone,
+                type: entry.type,
+                amount: entry.amountPaise,
+                description: entry.description,
+                totalBalance: balance?.balancePaise ?? 0,
+                merchantPhone: merchantPhone,
+              );
             },
           ),
           ListTile(

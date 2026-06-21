@@ -6,7 +6,7 @@ import 'package:googleapis/drive/v3.dart' as drive;
 import 'package:googleapis/sheets/v4.dart' as sheets;
 import 'package:http/http.dart' as http;
 
-import 'package:smartledger_ai/src/core/security_service.dart';
+import '../core/security_service.dart';
 import 'app_database.dart';
 import 'models.dart';
 
@@ -85,7 +85,7 @@ class LedgerRepository {
 
   Future<void> ensureReady() => _db.initialize();
 
-  Future<int> addCustomer(String name, {String phone = '', String notes = ''}) async {
+  Future<int> addCustomer(String name, {String phone = '', String notes = '', bool skipBackup = false}) async {
     await ensureReady();
     final id = await _db.customInsert(
       'INSERT INTO customers (name, phone, notes, created_at) VALUES (?, ?, ?, ?)',
@@ -96,7 +96,7 @@ class LedgerRepository {
         Variable(DateTime.now().millisecondsSinceEpoch),
       ],
     );
-    _backup.scheduleBackup(this);
+    if (!skipBackup) _backup.scheduleBackup(this);
     return id;
   }
 
@@ -119,7 +119,7 @@ class LedgerRepository {
   Future<int> findOrCreateCustomer(String name, {String? phone}) async {
     final existingId = await findCustomerId(name, phone: phone);
     if (existingId != null) return existingId;
-    return await addCustomer(name, phone: phone ?? '');
+    return await addCustomer(name, phone: phone ?? '', skipBackup: true);
   }
 
   Future<void> addEntry({
@@ -128,6 +128,7 @@ class LedgerRepository {
     required int amountPaise,
     String description = '',
     DateTime? createdAt,
+    bool skipBackup = false,
   }) async {
     await ensureReady();
     await _db.customInsert(
@@ -140,15 +141,15 @@ class LedgerRepository {
         Variable((createdAt ?? DateTime.now()).millisecondsSinceEpoch),
       ],
     );
-    // Trigger auto-backup
-    _backup.scheduleBackup(this);
+    if (!skipBackup) _backup.scheduleBackup(this);
   }
 
   Future<void> resetDatabase() async {
     await ensureReady();
     await _db.customStatement('DELETE FROM transactions');
     await _db.customStatement('DELETE FROM customers');
-    await _db.customStatement('DELETE FROM sqlite_sequence WHERE name IN ("transactions", "customers")');
+    // FIXED: Use single quotes for string literals in SQLite
+    await _db.customStatement("DELETE FROM sqlite_sequence WHERE name IN ('transactions', 'customers')");
   }
 
   Future<void> updateEntry({
@@ -167,7 +168,6 @@ class LedgerRepository {
         Variable(id),
       ],
     );
-    // Trigger auto-backup
     _backup.scheduleBackup(this);
   }
 
@@ -187,12 +187,11 @@ class LedgerRepository {
       'UPDATE transactions SET is_deleted = 1, is_synced = 0 WHERE id = ?',
       variables: [Variable(id)],
     );
-    // Trigger auto-backup
     _backup.scheduleBackup(this);
   }
 
   Future<void> syncSingleEntry(int id) async {
-    await _backup.backupToGoogleSheets(this);
+    await _backup.backupToGoogleSheets(this, onlyUnsynced: false);
   }
 
   Future<String> getSetting(String key, String defaultValue) async {
@@ -213,13 +212,9 @@ class LedgerRepository {
   Future<List<CustomerBalance>> customersWithBalances() async {
     await ensureReady();
     final rows = await _db.customSelect('''
-      SELECT c.id, c.name, c.phone, c.notes, c.created_at,
-        COALESCE(SUM(CASE WHEN t.is_deleted = 0 THEN (CASE WHEN t.type = 'credit' THEN t.amount_paise ELSE -t.amount_paise END) ELSE 0 END), 0) AS balance
-      FROM customers c
-      LEFT JOIN transactions t ON t.customer_id = c.id
-      GROUP BY c.id
-      HAVING balance != 0 OR c.created_at > 0
-      ORDER BY c.name COLLATE NOCASE
+      SELECT id, name, phone, notes, created_at, total_credit_paise, total_payment_paise, balance_paise
+      FROM customers
+      ORDER BY name COLLATE NOCASE
     ''').get();
     return rows.map(_customerFromRow).toList();
   }
@@ -227,12 +222,9 @@ class LedgerRepository {
   Future<CustomerBalance?> getCustomerBalance(int customerId) async {
     await ensureReady();
     final rows = await _db.customSelect('''
-      SELECT c.id, c.name, c.phone, c.notes, c.created_at,
-        COALESCE(SUM(CASE WHEN t.is_deleted = 0 THEN (CASE WHEN t.type = 'credit' THEN t.amount_paise ELSE -t.amount_paise END) ELSE 0 END), 0) AS balance
-      FROM customers c
-      LEFT JOIN transactions t ON t.customer_id = c.id
-      WHERE c.id = ?
-      GROUP BY c.id
+      SELECT id, name, phone, notes, created_at, total_credit_paise, total_payment_paise, balance_paise
+      FROM customers
+      WHERE id = ?
     ''', variables: [Variable(customerId)]).get();
     return rows.isEmpty ? null : _customerFromRow(rows.first);
   }
@@ -244,14 +236,17 @@ class LedgerRepository {
       phone: row.read<String>('phone'),
       notes: row.read<String>('notes'),
       createdAt: DateTime.fromMillisecondsSinceEpoch(row.read<int>('created_at')),
+      totalCreditPaise: row.read<int>('total_credit_paise'),
+      totalPaymentPaise: row.read<int>('total_payment_paise'),
+      balancePaise: row.read<int>('balance_paise'),
     );
-    return CustomerBalance(customer: customer, balancePaise: row.read<int>('balance'));
+    return CustomerBalance(customer: customer, balancePaise: customer.balancePaise);
   }
 
   Future<List<LedgerEntry>> recentEntries({int limit = 100}) async {
     await ensureReady();
     final rows = await _db.customSelect('''
-      SELECT t.id, t.customer_id, c.name AS customer_name, t.type, t.amount_paise, t.description, t.created_at, t.is_synced
+      SELECT t.id, t.customer_id, c.name AS customer_name, c.phone AS customer_phone, t.type, t.amount_paise, t.description, t.created_at, t.is_synced, t.is_deleted
       FROM transactions t
       JOIN customers c ON c.id = t.customer_id
       WHERE t.is_deleted = 0
@@ -264,7 +259,7 @@ class LedgerRepository {
   Future<List<LedgerEntry>> customerEntries(int customerId) async {
     await ensureReady();
     final rows = await _db.customSelect('''
-      SELECT t.id, t.customer_id, c.name AS customer_name, t.type, t.amount_paise, t.description, t.created_at, t.is_synced
+      SELECT t.id, t.customer_id, c.name AS customer_name, c.phone AS customer_phone, t.type, t.amount_paise, t.description, t.created_at, t.is_synced, t.is_deleted
       FROM transactions t
       JOIN customers c ON c.id = t.customer_id
       WHERE t.customer_id = ? AND t.is_deleted = 0
@@ -280,7 +275,7 @@ class LedgerRepository {
     final rows = await _db.customSelect('''
       SELECT
         (SELECT COUNT(*) FROM customers) AS customer_count,
-        COALESCE((SELECT SUM(CASE WHEN type = 'credit' THEN amount_paise ELSE -amount_paise END) FROM transactions WHERE is_deleted = 0), 0) AS outstanding,
+        COALESCE((SELECT SUM(balance_paise) FROM customers), 0) AS outstanding,
         COALESCE((SELECT SUM(amount_paise) FROM transactions WHERE type = 'credit' AND created_at >= ? AND is_deleted = 0), 0) AS today_credit,
         COALESCE((SELECT SUM(amount_paise) FROM transactions WHERE type = 'payment' AND created_at >= ? AND is_deleted = 0), 0) AS today_payment
     ''', variables: [Variable(start), Variable(start)]).get();
@@ -298,12 +293,37 @@ class LedgerRepository {
       id: row.read<int>('id'),
       customerId: row.read<int>('customer_id'),
       customerName: row.read<String>('customer_name'),
+      customerPhone: row.read<String>('customer_phone'),
       type: LedgerEntryType.values.byName(row.read<String>('type')),
       amountPaise: row.read<int>('amount_paise'),
       description: row.read<String>('description'),
       createdAt: DateTime.fromMillisecondsSinceEpoch(row.read<int>('created_at')),
       isSynced: row.read<int>('is_synced') == 1,
+      isDeleted: row.read<int>('is_deleted') == 1,
     );
+  }
+
+  Future<List<LedgerEntry>> getUnsyncedEntries() async {
+    await ensureReady();
+    final rows = await _db.customSelect('''
+      SELECT t.id, t.customer_id, c.name AS customer_name, c.phone AS customer_phone, t.type, t.amount_paise, t.description, t.created_at, t.is_synced, t.is_deleted
+      FROM transactions t
+      JOIN customers c ON c.id = t.customer_id
+      WHERE t.is_synced = 0
+      ORDER BY t.created_at ASC
+    ''').get();
+    return rows.map(_entryFromRow).toList();
+  }
+  
+  Future<List<LedgerEntry>> getAllEntriesForBackup() async {
+    await ensureReady();
+    final rows = await _db.customSelect('''
+      SELECT t.id, t.customer_id, c.name AS customer_name, c.phone AS customer_phone, t.type, t.amount_paise, t.description, t.created_at, t.is_synced, t.is_deleted
+      FROM transactions t
+      JOIN customers c ON c.id = t.customer_id
+      ORDER BY t.created_at ASC
+    ''').get();
+    return rows.map(_entryFromRow).toList();
   }
 }
 
@@ -314,7 +334,7 @@ class BackupService {
 
   void scheduleBackup(LedgerRepository repo) {
     _backupTimer?.cancel();
-    _backupTimer = Timer(const Duration(minutes: 1), () {
+    _backupTimer = Timer(const Duration(seconds: 10), () {
       backupToGoogleSheets(repo);
     });
   }
@@ -330,7 +350,7 @@ class BackupService {
 
   Future<void> signOut() => _googleSignIn.signOut();
 
-  Future<BackupResult> backupToGoogleSheets(LedgerRepository repo) async {
+  Future<BackupResult> backupToGoogleSheets(LedgerRepository repo, {bool onlyUnsynced = true}) async {
     final account = _googleSignIn.currentUser;
     if (account == null) {
       return const BackupResult.pendingConfiguration('Google account not connected.');
@@ -358,44 +378,103 @@ class BackupService {
         spreadsheetId = created.spreadsheetId!;
       }
 
-      final entries = await repo.recentEntries(limit: 10000); 
+      // Ensure both sheets exist before proceeding
+      final ss = await sheetsApi.spreadsheets.get(spreadsheetId);
+      final sheetNames = ss.sheets?.map((s) => s.properties?.title).toList() ?? [];
+
+      if (!sheetNames.contains('Customer Details') || !sheetNames.contains('Order Details')) {
+        final List<sheets.Request> requests = [];
+        if (!sheetNames.contains('Customer Details')) {
+          requests.add(sheets.Request(addSheet: sheets.AddSheetRequest(properties: sheets.SheetProperties(title: 'Customer Details'))));
+        }
+        if (!sheetNames.contains('Order Details')) {
+          requests.add(sheets.Request(addSheet: sheets.AddSheetRequest(properties: sheets.SheetProperties(title: 'Order Details'))));
+        }
+        await sheetsApi.spreadsheets.batchUpdate(sheets.BatchUpdateSpreadsheetRequest(requests: requests), spreadsheetId);
+      }
+
+      // 1. Sync Customer Details
       final customers = await repo.customersWithBalances();
-      final customerMap = {for (var c in customers) c.customer.id: c.customer};
-
-      final header = ['Date', 'Customer Name', 'Customer Phone', 'Type', 'Amount', 'Description'];
-      final rows = entries.map((e) {
-        final c = customerMap[e.customerId];
-        return [
-          e.createdAt.toIso8601String(),
-          e.customerName,
-          c?.phone ?? '',
-          e.type.name,
-          (e.amountPaise / 100).toStringAsFixed(2),
-          e.description,
-        ];
-      }).toList();
-
-      final valueRange = sheets.ValueRange(
-        values: [header, ...rows],
-      );
+      final customerHeader = ['ID', 'Name', 'Phone', 'Total Credit', 'Total Payment', 'Balance', 'Created At'];
+      final customerRows = customers.map((c) => [
+        c.customer.id.toString(),
+        c.customer.name,
+        c.customer.phone,
+        (c.customer.totalCreditPaise / 100).toStringAsFixed(2),
+        (c.customer.totalPaymentPaise / 100).toStringAsFixed(2),
+        (c.customer.balancePaise / 100).toStringAsFixed(2),
+        c.customer.createdAt.toIso8601String(),
+      ]).toList();
 
       await sheetsApi.spreadsheets.values.update(
-        valueRange,
+        sheets.ValueRange(values: [customerHeader, ...customerRows]),
         spreadsheetId,
-        'Sheet1!A1',
+        'Customer Details!A1',
         valueInputOption: 'RAW',
       );
 
-      // Mark entries as synced in database
-      await repo.markEntriesAsSynced(entries.map((e) => e.id).toList());
+      // 2. Sync Order Details
+      final List<LedgerEntry> entriesToSync;
+      if (onlyUnsynced) {
+        entriesToSync = await repo.getUnsyncedEntries();
+      } else {
+        entriesToSync = await repo.getAllEntriesForBackup();
+      }
 
-      return const BackupResult.ok('Sync to Google Sheets successful.');
+      if (entriesToSync.isEmpty) {
+        return const BackupResult.ok('Already up to date.');
+      }
+
+      final orderHeader = ['TID', 'Date', 'Customer ID', 'Customer Name', 'Type', 'Amount', 'Description', 'Is Deleted'];
+      
+      if (onlyUnsynced) {
+        final rows = entriesToSync.map((e) => [
+          e.id.toString(),
+          e.createdAt.toIso8601String(),
+          e.customerId.toString(),
+          e.customerName,
+          e.type.name,
+          (e.amountPaise / 100).toStringAsFixed(2),
+          e.description,
+          e.isDeleted ? '1' : '0',
+        ]).toList();
+
+        await sheetsApi.spreadsheets.values.append(
+          sheets.ValueRange(values: rows),
+          spreadsheetId,
+          'Order Details!A1',
+          valueInputOption: 'RAW',
+        );
+      } else {
+        final allEntries = await repo.getAllEntriesForBackup();
+        final rows = allEntries.map((e) => [
+          e.id.toString(),
+          e.createdAt.toIso8601String(),
+          e.customerId.toString(),
+          e.customerName,
+          e.type.name,
+          (e.amountPaise / 100).toStringAsFixed(2),
+          e.description,
+          e.isDeleted ? '1' : '0',
+        ]).toList();
+
+        await sheetsApi.spreadsheets.values.update(
+          sheets.ValueRange(values: [orderHeader, ...rows]),
+          spreadsheetId,
+          'Order Details!A1',
+          valueInputOption: 'RAW',
+        );
+      }
+
+      await repo.markEntriesAsSynced(entriesToSync.map((e) => e.id).toList());
+
+      return const BackupResult.ok('Sync successful.');
     } catch (e) {
       return BackupResult.error('Sheets Sync failed: $e');
     }
   }
 
-  Future<BackupResult> restoreFromGoogleSheets(LedgerRepository repo) async {
+  Future<BackupResult> restoreFromGoogleSheets(LedgerRepository repo, {int? filterCustomerId, DateTime? startDate, DateTime? endDate}) async {
     final account = _googleSignIn.currentUser;
     if (account == null) return const BackupResult.pendingConfiguration('Connect Google account.');
 
@@ -415,41 +494,71 @@ class BackupService {
       }
 
       final spreadsheetId = list.files!.first.id!;
-      final response = await sheetsApi.spreadsheets.values.get(spreadsheetId, 'Sheet1!A:F');
-      
-      final rows = response.values;
-      if (rows == null || rows.length <= 1) {
-        return const BackupResult.error('Backup sheet is empty.');
+
+      // 1. Restore Customer Details if doing full restore
+      if (filterCustomerId == null) {
+        final customerResponse = await sheetsApi.spreadsheets.values.get(spreadsheetId, 'Customer Details!A:G');
+        final cRows = customerResponse.values;
+        if (cRows != null && cRows.length > 1) {
+          await repo.resetDatabase();
+          for (var i = 1; i < cRows.length; i++) {
+            final row = cRows[i];
+            if (row.length < 3) continue;
+            await repo.addCustomer(
+              row[1].toString(), 
+              phone: row[2].toString(), 
+              skipBackup: true
+            );
+          }
+        }
       }
 
-      await repo.resetDatabase();
+      // 2. Restore Order Details
+      final response = await sheetsApi.spreadsheets.values.get(spreadsheetId, 'Order Details!A:H');
+      final rows = response.values;
+      if (rows == null || rows.length <= 1) {
+        return const BackupResult.error('No orders found.');
+      }
+
+      final Map<String, int> sheetCustomerIdToLocalId = {};
 
       for (var i = 1; i < rows.length; i++) {
         final row = rows[i];
-        if (row.length < 5) continue;
+        if (row.length < 6) continue;
 
-        final dateStr = row[0].toString();
-        final name = row[1].toString();
-        final phone = row[2].toString();
-        final typeName = row[3].toString();
-        final amountRupees = double.tryParse(row[4].toString()) ?? 0.0;
-        final description = row.length > 5 ? row[5].toString() : '';
+        final date = DateTime.tryParse(row[1].toString()) ?? DateTime.now();
+        final sheetCustomerId = row[2].toString();
+        final name = row[3].toString();
+        final typeName = row[4].toString();
+        final amountRupees = double.tryParse(row[5].toString()) ?? 0.0;
+        final description = row.length > 6 ? row[6].toString() : '';
+        final isDeleted = row.length > 7 ? row[7].toString() == '1' : false;
 
-        final customerId = await repo.findOrCreateCustomer(name, phone: phone);
+        // Apply filters
+        if (isDeleted) continue;
+        if (filterCustomerId != null && sheetCustomerId != filterCustomerId.toString()) continue;
+        if (startDate != null && date.isBefore(startDate)) continue;
+        if (endDate != null && date.isAfter(endDate)) continue;
+
+        int? customerId;
+        if (sheetCustomerIdToLocalId.containsKey(sheetCustomerId)) {
+          customerId = sheetCustomerIdToLocalId[sheetCustomerId];
+        } else {
+          customerId = await repo.findOrCreateCustomer(name);
+          sheetCustomerIdToLocalId[sheetCustomerId] = customerId;
+        }
+
         await repo.addEntry(
-          customerId: customerId,
+          customerId: customerId!,
           type: LedgerEntryType.values.byName(typeName),
           amountPaise: (amountRupees * 100).round(),
           description: description,
-          createdAt: DateTime.tryParse(dateStr),
+          createdAt: date,
+          skipBackup: true,
         );
       }
       
-      // Mark all as synced after restore
-      final newEntries = await repo.recentEntries(limit: 10000);
-      await repo.markEntriesAsSynced(newEntries.map((e) => e.id).toList());
-
-      return const BackupResult.ok('Restore from Sheets successful.');
+      return const BackupResult.ok('Restore successful.');
     } catch (e) {
       return BackupResult.error('Restore failed: $e');
     }

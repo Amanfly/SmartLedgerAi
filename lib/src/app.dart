@@ -69,6 +69,15 @@ class _ShellScreenState extends ConsumerState<ShellScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      appBar: AppBar(
+        title: Row(
+          children: [
+            Image.asset('assets/logo.png', height: 32),
+            const SizedBox(width: 12),
+            Text(_title(_index)),
+          ],
+        ),
+      ),
       body: _screens[_index],
       floatingActionButton: _buildFab(),
       bottomNavigationBar: NavigationBar(
@@ -84,32 +93,43 @@ class _ShellScreenState extends ConsumerState<ShellScreen> {
     );
   }
 
-  Widget _buildFab() {
+  String _title(int index) {
+    switch (index) {
+      case 0: return 'Smart Ledger AI';
+      case 1: return 'Customers';
+      case 2: return 'Reports';
+      case 3: return 'Settings';
+      default: return '';
+    }
+  }
+
+  Widget? _buildFab() {
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.end,
       children: [
-        if (_index == 0) // Dashboard / Ledger tab
+        FloatingActionButton(
+          heroTag: 'assistant',
+          onPressed: () => _showAssistant(context),
+          backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+          mini: true,
+          child: const Icon(Icons.smart_toy_outlined),
+        ),
+        const SizedBox(height: 12),
+        if (_index == 0)
           FloatingActionButton.extended(
             heroTag: 'new_entry',
             onPressed: () => LedgerScreen.showEntrySheet(context, ref),
             icon: const Icon(Icons.add),
             label: const Text('New Entry'),
           ),
-        if (_index == 1) // Customers tab
+        if (_index == 1)
           FloatingActionButton.extended(
             heroTag: 'new_customer',
             onPressed: () => CustomersScreen.addCustomerDialog(context, ref),
             icon: const Icon(Icons.person_add_alt_1_outlined),
             label: const Text('New Customer'),
           ),
-        const SizedBox(height: 12),
-        FloatingActionButton(
-          heroTag: 'assistant',
-          onPressed: () => _showAssistant(context),
-          backgroundColor: Theme.of(context).colorScheme.primaryContainer,
-          child: const Icon(Icons.smart_toy_outlined),
-        ),
       ],
     );
   }
